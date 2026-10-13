@@ -1,9 +1,12 @@
 package validate
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/serhii-chechun/pg-query-validate/internal/diagnostic"
 	"github.com/serhii-chechun/pg-query-validate/internal/meta"
@@ -11,6 +14,8 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 
 	pgq "github.com/pganalyze/pg_query_go/v6"
+
+	"github.com/pganalyze/pg_query_go/v6/parser"
 )
 
 type Error struct{ count int }
@@ -28,8 +33,13 @@ func Process(name string, r io.Reader) error {
 		return fmt.Errorf("reading input: %w", err)
 	}
 
-	tree, err := pgq.Parse(string(meta.Mask(src)))
+	masked := meta.Mask(src)
+	tree, err := pgq.Parse(string(masked))
 	if err != nil {
+		if d, ok := parseErrorDiagnostic(err, masked); ok {
+			diagnostic.Write(os.Stderr, name, src, []diagnostic.Results{d})
+			return &Error{count: 1}
+		}
 		return fmt.Errorf("PG_SQL parsing: %w", err)
 	}
 
@@ -144,4 +154,71 @@ func validateTypeName(m protoreflect.Message, src []byte) (diagnostic.Results, b
 		Offset:  offset,
 		Length:  length,
 	}, true
+}
+
+// parseErrorDiagnostic converts a PostgreSQL parser error into a source-anchored
+// finding.
+func parseErrorDiagnostic(err error, masked []byte) (diagnostic.Results, bool) {
+	var pe *parser.Error
+	if !errors.As(err, &pe) {
+		return diagnostic.Results{}, false
+	}
+
+	offset := cursorByteOffset(masked, pe.Cursorpos)
+	length := 1
+	if tok, ok := errorToken(pe.Message); ok &&
+		offset >= 0 && offset+len(tok) <= len(masked) &&
+		strings.EqualFold(string(masked[offset:offset+len(tok)]), tok) {
+		length = len(tok)
+	}
+
+	if len(masked) > 0 && offset >= len(masked) {
+		end := len(masked)
+		for end > 0 && (masked[end-1] == '\n' || masked[end-1] == '\r') {
+			end--
+		}
+		if end > 0 {
+			offset = end - 1
+		} else {
+			offset = len(masked) - 1
+		}
+		length = 1
+	}
+	return diagnostic.Results{Message: pe.Message, Offset: offset, Length: length}, true
+}
+
+// cursorByteOffset converts a 1-based character position.
+func cursorByteOffset(src []byte, cursorpos int) int {
+	if cursorpos < 1 {
+		return -1
+	}
+	chars := cursorpos - 1
+	for i := 0; i < len(src); {
+		if chars == 0 {
+			return i
+		}
+		_, size := utf8.DecodeRune(src[i:])
+		i += size
+		chars--
+	}
+	return len(src)
+}
+
+// errorToken extracts the token quoted by the "at or near \"...\"" clause of a
+// parser error message, or reports false when the message has no such clause.
+func errorToken(message string) (string, bool) {
+	const marker = "at or near "
+	i := strings.Index(message, marker)
+	if i < 0 {
+		return "", false
+	}
+	rest := message[i+len(marker):]
+	if len(rest) < 2 || rest[0] != '"' {
+		return "", false
+	}
+	j := strings.IndexByte(rest[1:], '"')
+	if j < 0 {
+		return "", false
+	}
+	return rest[1 : 1+j], true
 }

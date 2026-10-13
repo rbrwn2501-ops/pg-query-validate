@@ -1,6 +1,7 @@
 package validate
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -166,6 +167,124 @@ func TestWriteDiagnosticsWithoutSourceSpan(t *testing.T) {
 	diagnostic.Write(&out, "m.sql", nil, []diagnostic.Results{{Message: "statement 1: missing statement", Offset: -1}})
 	if want := "error: statement 1: missing statement\n"; out.String() != want {
 		t.Errorf("rendered = %q, want %q", out.String(), want)
+	}
+}
+
+// TestParseErrorDiagnosticLocatesToken checks that a syntax error is turned
+// into a source-anchored finding pointing at the offending token.
+func TestParseErrorDiagnosticLocatesToken(t *testing.T) {
+	src := "create table t (\n    id uuid\n);\nselect 1 from t where);\n"
+	masked := meta.Mask([]byte(src))
+	_, err := pgq.Parse(string(masked))
+	if err == nil {
+		t.Fatal("expected a parse error")
+	}
+
+	d, ok := parseErrorDiagnostic(err, masked)
+	if !ok {
+		t.Fatal("parseErrorDiagnostic did not recognise the parser error")
+	}
+
+	wantOffset := strings.Index(src, "where)") + len("where")
+	if d.Offset != wantOffset || d.Length != 1 {
+		t.Fatalf("span = (%d, %d), want (%d, 1)", d.Offset, d.Length, wantOffset)
+	}
+	if !strings.Contains(d.Message, `syntax error at or near ")"`) {
+		t.Errorf("message = %q, want it to mention the offending token", d.Message)
+	}
+
+	var out strings.Builder
+	diagnostic.Write(&out, "test.sql", []byte(src), []diagnostic.Results{d})
+	for _, want := range []string{
+		"error: syntax error at or near \")\"\n",
+		" --> test.sql:4:22\n",
+		"4 | select 1 from t where);\n",
+		"  | " + strings.Repeat(" ", 21) + "^\n",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("rendered diagnostics missing %q\n got:\n%s", want, out.String())
+		}
+	}
+}
+
+// TestParseErrorDiagnosticEndOfInput checks that an error raised at the end of
+// input is anchored to a real character so the caret is drawn.
+func TestParseErrorDiagnosticEndOfInput(t *testing.T) {
+	src := "select 1\nfrom\n"
+	_, err := pgq.Parse(src)
+	if err == nil {
+		t.Fatal("expected a parse error")
+	}
+
+	d, ok := parseErrorDiagnostic(err, []byte(src))
+	if !ok {
+		t.Fatal("parseErrorDiagnostic did not recognise the parser error")
+	}
+	// "from" occupies offsets 9..12; the trailing newline is skipped.
+	if d.Offset != 12 || d.Length != 1 {
+		t.Fatalf("span = (%d, %d), want (12, 1)", d.Offset, d.Length)
+	}
+}
+
+// TestParseErrorDiagnosticIgnoresOtherErrors confirms a non-parser error is left
+// to the caller to report.
+func TestParseErrorDiagnosticIgnoresOtherErrors(t *testing.T) {
+	if _, ok := parseErrorDiagnostic(errors.New("boom"), nil); ok {
+		t.Error("parseErrorDiagnostic accepted a non-parser error")
+	}
+}
+
+func TestCursorByteOffset(t *testing.T) {
+	const ascii = "select 1"
+	const multibyte = "é🎉a" // 1 + 2 + 4 bytes
+
+	tests := []struct {
+		label    string
+		src      string
+		cursor   int
+		wantByte int
+	}{
+		{label: "zero is invalid", src: ascii, cursor: 0, wantByte: -1},
+		{label: "negative is invalid", src: ascii, cursor: -3, wantByte: -1},
+		{label: "first character", src: ascii, cursor: 1, wantByte: 0},
+		{label: "middle character", src: ascii, cursor: 8, wantByte: 7},
+		{label: "one past end clamps to length", src: ascii, cursor: 9, wantByte: 8},
+		{label: "far past end clamps to length", src: ascii, cursor: 100, wantByte: 8},
+		{label: "multibyte first rune", src: multibyte, cursor: 1, wantByte: 0},
+		{label: "multibyte second rune", src: multibyte, cursor: 2, wantByte: 2},
+		{label: "multibyte third rune", src: multibyte, cursor: 3, wantByte: 6},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.label, func(t *testing.T) {
+			if got := cursorByteOffset([]byte(tt.src), tt.cursor); got != tt.wantByte {
+				t.Errorf("cursorByteOffset(%q, %d) = %d, want %d", tt.src, tt.cursor, got, tt.wantByte)
+			}
+		})
+	}
+}
+
+func TestErrorToken(t *testing.T) {
+	tests := []struct {
+		label   string
+		message string
+		want    string
+		wantOK  bool
+	}{
+		{label: "closing paren", message: `syntax error at or near ")"`, want: ")", wantOK: true},
+		{label: "keyword", message: `syntax error at or near "from"`, want: "from", wantOK: true},
+		{label: "empty quoted token", message: `syntax error at or near ""`, want: "", wantOK: true},
+		{label: "end of input has no token", message: "syntax error at end of input", wantOK: false},
+		{label: "unrelated message", message: "division by zero", wantOK: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.label, func(t *testing.T) {
+			got, ok := errorToken(tt.message)
+			if ok != tt.wantOK || got != tt.want {
+				t.Errorf("errorToken(%q) = (%q, %v), want (%q, %v)", tt.message, got, ok, tt.want, tt.wantOK)
+			}
+		})
 	}
 }
 
